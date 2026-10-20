@@ -7,6 +7,7 @@ from starlette.responses import JSONResponse
 
 PORT = 8000
 SECRET = os.environ.get("JJ_SECRET") or secrets.token_urlsafe(24)
+DOMAIN = os.environ.get("NGROK_DOMAIN") or "subpanel-unreached-skinning.ngrok-free.dev"
 WORK = Path(os.environ.get("REA_WORKDIR", str(Path.home() / "rea-work")))
 WORK.mkdir(parents=True, exist_ok=True)
 MAX = 20000
@@ -66,16 +67,18 @@ def _heartbeat():
         time.sleep(60)
         print("heartbeat: JJserver vivo", flush=True)
 
-if __name__ == "__main__":
-    threading.Thread(target=_heartbeat, daemon=True).start()
+def _open_tunnel():
+    """Abre o ngrok tentando formatos diferentes de dominio; se todos falharem, usa URL aleatoria."""
+    from pyngrok import ngrok, conf
     token = os.environ.get("NGROK_AUTHTOKEN")
     if token:
-        from pyngrok import ngrok, conf
         conf.get_default().auth_token = token
-        dom = os.environ.get("NGROK_DOMAIN")  # dominio estatico gratuito do ngrok (URL nao muda)
-        opts = {"domain": dom} if dom else {}
-        pub = ngrok.connect(PORT, "http", **opts).public_url.replace("http://", "https://")
-        print(f"\n=== COLE NO CLAUDE / JJserver APK ===\n{pub}/{SECRET}/mcp\n")
-    else:
-        print(f"Sem NGROK_AUTHTOKEN. Local: http://localhost:{PORT}/{SECRET}/mcp")
-    mcp.run(transport="streamable-http")
+    attempts = [
+        {"domain": DOMAIN},
+        {"hostname": DOMAIN},
+        {},
+    ]
+    last_err = None
+    for opts in attempts:
+        try:
+            t = ngrok.connect(addr=PO
