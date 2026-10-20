@@ -2,7 +2,6 @@
 import os, secrets, shutil, subprocess, threading, time
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 
 PORT = 8000
@@ -13,11 +12,8 @@ WORK.mkdir(parents=True, exist_ok=True)
 MAX = 20000
 BINS = ["jadx", "apktool", "r2", "binwalk", "objdump", "strings", "gdb", "xxd", "file", "java"]
 
-mcp = FastMCP(
-    "REA", host="0.0.0.0", port=PORT, stateless_http=True, json_response=True,
-    streamable_http_path=f"/{SECRET}/mcp",
-    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-)
+mcp = FastMCP("REA", host="0.0.0.0", port=PORT, stateless_http=True, json_response=True,
+              streamable_http_path=f"/{SECRET}/mcp")
 
 @mcp.custom_route("/status", methods=["GET"])
 async def status(request):
@@ -68,17 +64,27 @@ def _heartbeat():
         print("heartbeat: JJserver vivo", flush=True)
 
 def _open_tunnel():
-    """Abre o ngrok tentando formatos diferentes de dominio; se todos falharem, usa URL aleatoria."""
+    """Abre o ngrok com o dominio fixo; se falhar, tenta sem dominio."""
     from pyngrok import ngrok, conf
     token = os.environ.get("NGROK_AUTHTOKEN")
     if token:
         conf.get_default().auth_token = token
-    attempts = [
-        {"domain": DOMAIN},
-        {"hostname": DOMAIN},
-        {},
-    ]
+    attempts = [{"domain": DOMAIN}, {}]
     last_err = None
     for opts in attempts:
         try:
-            t = ngrok.connect(addr=PO
+            t = ngrok.connect(addr=PORT, proto="http", **opts)
+            return t.public_url.replace("http://", "https://")
+        except Exception as e:
+            last_err = e
+            print(f"[ngrok] tentativa {opts or 'sem dominio'} falhou: {str(e)[:200]}", flush=True)
+    raise RuntimeError(f"ngrok nao conectou: {last_err}")
+
+if __name__ == "__main__":
+    threading.Thread(target=_heartbeat, daemon=True).start()
+    if os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("NGROK_DOMAIN"):
+        pub = _open_tunnel()
+        print(f"\n=== COLE NO CLAUDE / JJserver APK ===\n{pub}/{SECRET}/mcp\n", flush=True)
+    else:
+        print(f"Sem NGROK_AUTHTOKEN. Local: http://localhost:{PORT}/{SECRET}/mcp", flush=True)
+    mcp.run(transport="streamable-http")
