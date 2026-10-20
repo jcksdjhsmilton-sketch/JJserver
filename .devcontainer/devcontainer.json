@@ -1,0 +1,7 @@
+{
+  "name": "JJserver-REA",
+  "image": "mcr.microsoft.com/devcontainers/python:3.12-bookworm",
+  "postCreateCommand": "bash server/setup.sh",
+  "postStartCommand": "setsid nohup python server/server.py > /tmp/jj.log 2>&1 &",
+  "forwardPorts": [8000]
+}
