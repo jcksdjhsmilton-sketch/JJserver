@@ -1,6 +1,7 @@
 package com.jj.server;
 
 import android.app.Activity;
+import android.app.AlertDialog;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
@@ -19,8 +20,12 @@ import android.widget.Toast;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import org.json.JSONArray;
@@ -36,7 +41,7 @@ public class MainActivity extends Activity {
     SharedPreferences sp;
     EditText token, repo, domain, secret;
     TextView urlView, log;
-    ExecutorService ex = Executors.newSingleThreadExecutor();
+    ExecutorService ex = Executors.newCachedThreadPool();
 
     @Override
     protected void onCreate(Bundle b) {
@@ -46,7 +51,7 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 48, 24, 24);
 
-        token = field("GitHub token (permissao codespace)", sp.getString("token", ""));
+        token = field("GitHub token (classic, com permissao codespace)", sp.getString("token", ""));
         token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         repo = field("Repositorio (usuario/JJserver)", sp.getString("repo", DEF_REPO));
         domain = field("Dominio ngrok", sp.getString("domain", DEF_DOMAIN));
@@ -67,12 +72,13 @@ public class MainActivity extends Activity {
         domain.addTextChangedListener(tw);
         secret.addTextChangedListener(tw);
 
-        LinearLayout r1 = row(), r2 = row();
+        LinearLayout r1 = row(), r2 = row(), r3 = row();
         r1.addView(btn("Status", v -> bg(this::refresh)));
-        r1.addView(btn("Ligar", v -> bg(() -> action("start"))));
-        r1.addView(btn("Desligar", v -> bg(() -> action("stop"))));
+        r1.addView(btn("Ligar", v -> bg(this::ligar)));
+        r1.addView(btn("Desligar", v -> bg(this::desligar)));
         r2.addView(btn("Testar MCP", v -> bg(this::testMcp)));
         r2.addView(btn("Copiar URL", v -> copy()));
+        r3.addView(btn("Recriar Codespace (so se o Ligar nao funcionar)", v -> confirmarRecriar()));
 
         log = new TextView(this);
         log.setTextIsSelectable(true);
@@ -86,6 +92,7 @@ public class MainActivity extends Activity {
         root.addView(urlView);
         root.addView(r1);
         root.addView(r2);
+        root.addView(r3);
         root.addView(log);
         ScrollView sv = new ScrollView(this);
         sv.addView(root);
@@ -137,7 +144,7 @@ public class MainActivity extends Activity {
         });
     }
 
-    String http(String method, String u, String bearer) throws Exception {
+    String http(String method, String u, String bearer, String body) throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(u).openConnection();
         c.setRequestMethod(method);
         c.setConnectTimeout(15000);
@@ -149,9 +156,13 @@ public class MainActivity extends Activity {
             c.setRequestProperty("X-GitHub-Api-Version", "2022-11-28");
         }
         if (method.equals("POST")) {
+            byte[] data = body == null ? new byte[0] : body.getBytes(StandardCharsets.UTF_8);
+            if (body != null) c.setRequestProperty("Content-Type", "application/json");
             c.setDoOutput(true);
-            c.setFixedLengthStreamingMode(0);
-            c.getOutputStream().close();
+            c.setFixedLengthStreamingMode(data.length);
+            OutputStream os = c.getOutputStream();
+            os.write(data);
+            os.close();
         }
         int code = c.getResponseCode();
         InputStream is = code < 400 ? c.getInputStream() : c.getErrorStream();
@@ -161,68 +172,139 @@ public class MainActivity extends Activity {
             int n;
             while ((n = is.read(buf)) > 0) bo.write(buf, 0, n);
         }
-        String body = bo.toString("UTF-8");
-        if (code >= 400) throw new IOException("HTTP " + code + ": " + body);
-        return body;
+        String resp = bo.toString("UTF-8");
+        if (code >= 400) throw new IOException("HTTP " + code + ": " + resp);
+        return resp;
     }
 
-    String gh(String method, String path) throws Exception {
-        return http(method, "https://api.github.com" + path, token.getText().toString().trim());
+    String tok() throws Exception {
+        String t = token.getText().toString().trim();
+        if (t.isEmpty()) throw new IOException("Cole o token do GitHub no primeiro campo");
+        return t;
     }
 
-    JSONObject findCs() throws Exception {
-        JSONArray a = new JSONObject(gh("GET", "/user/codespaces")).getJSONArray("codespaces");
-        if (a.length() == 0) throw new IOException("Nenhum codespace encontrado");
-        String want = repo.getText().toString().trim().toLowerCase();
+    String repoName() throws Exception {
+        String r = repo.getText().toString().trim();
+        if (!r.contains("/")) throw new IOException("Preencha o repositorio como usuario/JJserver");
+        return r;
+    }
+
+    String gh(String method, String path, String body) throws Exception {
+        return http(method, "https://api.github.com" + path, tok(), body);
+    }
+
+    List<JSONObject> findAll() throws Exception {
+        JSONArray a = new JSONObject(gh("GET", "/user/codespaces", null)).getJSONArray("codespaces");
+        String want = repoName().toLowerCase();
+        List<JSONObject> out = new ArrayList<>();
         for (int i = 0; i < a.length(); i++) {
             JSONObject o = a.getJSONObject(i);
             String full = o.getJSONObject("repository").getString("full_name").toLowerCase();
-            if (want.isEmpty() || full.contains(want)) return o;
+            if (full.equals(want)) out.add(o);
         }
-        throw new IOException("Nenhum codespace do repo '" + want + "'");
+        return out;
+    }
+
+    JSONObject findCs() throws Exception {
+        List<JSONObject> l = findAll();
+        return l.isEmpty() ? null : l.get(0);
+    }
+
+    boolean serverUp() {
+        try {
+            return http("GET", baseUrl() + "/status", null, null).contains("\"ok\"");
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     void refresh() throws Exception {
         JSONObject o = findCs();
+        if (o == null) {
+            say("Nenhum Codespace deste repositorio.\nToque em Ligar para criar um (5 a 10 min).");
+            return;
+        }
         say(o.getString("display_name") + "\nestado: " + o.getString("state")
+                + "\nservidor: " + (serverUp() ? "NO AR" : "offline")
                 + "\n\nURL MCP:\n" + mcpUrl());
     }
 
-    void action(String a) throws Exception {
+    void ligar() throws Exception {
         JSONObject o = findCs();
-        gh("POST", "/user/codespaces/" + o.getString("name") + "/" + a);
-        if (a.equals("start")) {
-            say("Ligando...");
-            waitUp();
-        } else {
-            say("Desligando...");
-            Thread.sleep(5000);
-            refresh();
+        if (o == null) {
+            criar();
+            return;
         }
+        if (serverUp()) {
+            say("Servidor ja esta no ar!\n\nURL MCP:\n" + mcpUrl());
+            return;
+        }
+        say("Ligando...");
+        waitUp(900);
     }
 
-    void waitUp() throws Exception {
-        for (int i = 0; i < 30; i++) {
-            Thread.sleep(5000);
-            String st = findCs().getString("state");
-            if (st.equals("Available")) {
-                try {
-                    String r = http("GET", baseUrl() + "/status", null);
-                    if (r.contains("\"ok\"")) {
-                        say("Servidor no ar!\n\nURL MCP:\n" + mcpUrl());
-                        return;
-                    }
-                } catch (Exception ignore) { }
-                say("Codespace ligado, esperando o servidor subir... (" + (i * 5) + "s)");
-            } else {
-                say("Estado: " + st + " (" + (i * 5) + "s)");
-            }
+    void desligar() throws Exception {
+        JSONObject o = findCs();
+        if (o == null) {
+            say("Nenhum Codespace.");
+            return;
         }
-        say("Demorou. Toque em Testar MCP. Se nao subir, rode no terminal: python server/server.py");
+        gh("POST", "/user/codespaces/" + o.getString("name") + "/stop", null);
+        say("Desligando...");
+        Thread.sleep(5000);
+        refresh();
+    }
+
+    void criar() throws Exception {
+        say("Criando Codespace novo... (5 a 10 min na primeira vez)");
+        gh("POST", "/repos/" + repoName() + "/codespaces", "{\"ref\":\"main\",\"idle_timeout_minutes\":240}");
+        waitUp(1500);
+    }
+
+    void recriar() throws Exception {
+        for (JSONObject o : findAll()) {
+            say("Apagando " + o.getString("display_name") + "...");
+            gh("DELETE", "/user/codespaces/" + o.getString("name"), null);
+        }
+        Thread.sleep(10000);
+        criar();
+    }
+
+    void waitUp(int maxSec) throws Exception {
+        boolean started = false;
+        for (int t = 0; t < maxSec; t += 5) {
+            JSONObject o = findCs();
+            if (o == null) throw new IOException("O Codespace sumiu");
+            String st = o.getString("state");
+            if (st.equals("Shutdown") || st.equals("Archived")) {
+                if (!started) {
+                    gh("POST", "/user/codespaces/" + o.getString("name") + "/start", null);
+                    started = true;
+                }
+            } else if (st.equals("Failed") || st.equals("Deleted")) {
+                throw new IOException("Codespace em estado " + st);
+            } else if (st.equals("Available") && serverUp()) {
+                say("Servidor no ar!\n\nURL MCP:\n" + mcpUrl());
+                return;
+            }
+            String dica = t >= 300 ? "\n\nSe for um Codespace antigo, toque em Recriar Codespace." : "";
+            say("Estado: " + st + " | servidor ainda nao respondeu (" + t + "s)\nA primeira vez demora 5 a 10 min. Pode deixar o app aberto." + dica);
+            Thread.sleep(5000);
+        }
+        say("Demorou demais. Toque em Status daqui a pouco.");
+    }
+
+    void confirmarRecriar() {
+        new AlertDialog.Builder(this)
+                .setTitle("Recriar Codespace")
+                .setMessage("Apaga o Codespace atual (arquivos dentro dele sao perdidos) e cria um novo que sobe o servidor sozinho. Continuar?")
+                .setPositiveButton("Recriar", (d, w) -> bg(this::recriar))
+                .setNegativeButton("Cancelar", null)
+                .show();
     }
 
     void testMcp() throws Exception {
-        say(http("GET", baseUrl() + "/status", null) + "\n\nURL MCP:\n" + mcpUrl());
+        say(http("GET", baseUrl() + "/status", null, null) + "\n\nURL MCP:\n" + mcpUrl());
     }
 
     void copy() {
