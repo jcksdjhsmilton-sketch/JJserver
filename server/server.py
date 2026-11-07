@@ -1,4 +1,11 @@
-"""JJserver - MCP do REA (Reverse Engineering Everything) + tunel ngrok."""
+"""JJserver v4 - MCP do REA (Reverse Engineering Everything) + tunel ngrok.
+
+Mudancas da v4:
+- O servidor SEMPRE sobe, mesmo se o ngrok falhar.
+- O ngrok roda em outra thread e tenta de novo para sempre, SOMENTE no dominio fixo
+  (nada de cair para URL aleatoria, que o app nunca enxerga).
+- /status mostra o estado do tunel e o motivo do erro.
+"""
 import os, shutil, subprocess, threading, time
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP
@@ -13,12 +20,15 @@ WORK.mkdir(parents=True, exist_ok=True)
 MAX = 20000
 BINS = ["jadx", "apktool", "r2", "binwalk", "objdump", "strings", "gdb", "xxd", "file", "java"]
 
+TUNNEL = {"state": "iniciando", "url": None, "erro": None, "tentativas": 0}
+
 mcp = FastMCP("REA", host="0.0.0.0", port=PORT, stateless_http=True, json_response=True,
               streamable_http_path=f"/{SECRET}/mcp")
 
 @mcp.custom_route("/status", methods=["GET"])
 async def status(request):
-    return JSONResponse({"server": "JJserver/REA", "ok": True,
+    return JSONResponse({"server": "JJserver/REA", "ok": True, "version": "4",
+                         "tunnel": TUNNEL,
                          "tools": {b: bool(shutil.which(b)) for b in BINS}})
 
 @mcp.tool()
@@ -61,28 +71,70 @@ def rea_tools() -> dict:
 def _heartbeat():
     while True:
         time.sleep(60)
-        print("heartbeat: JJserver vivo", flush=True)
+        print(f"heartbeat: JJserver vivo | tunel: {TUNNEL['state']} | {TUNNEL['erro'] or 'ok'}",
+              flush=True)
 
-def _open_tunnel():
+def _explica(msg):
+    m = msg.lower()
+    if "108" in m or "simultaneous" in m:
+        return ("limite de 1 sessao ngrok (plano free): ha outro agente ngrok ativo. "
+                "Pare em dashboard.ngrok.com/agents (Stop) ou espere ~1 min.")
+    if "334" in m or "already online" in m:
+        return ("dominio ja esta em uso por outro endpoint (Codespace antigo ainda ligado?). "
+                "Veja dashboard.ngrok.com/endpoints e pare o antigo.")
+    if "authtoken" in m or "105" in m or "106" in m or "107" in m:
+        return "authtoken invalido. Gere outro em dashboard.ngrok.com/get-started/your-authtoken"
+    return msg[:250]
+
+def _tunnel_loop():
+    token = os.environ.get("NGROK_AUTHTOKEN", "").strip()
+    if not token:
+        TUNNEL.update(state="sem_token",
+                      erro="NGROK_AUTHTOKEN nao existe neste Codespace. Crie o secret em "
+                           "github.com/settings/codespaces (nome exato NGROK_AUTHTOKEN, "
+                           "com acesso ao repo JJserver) e recrie o Codespace.")
+        print("ERRO: " + TUNNEL["erro"], flush=True)
+        print(f"Servidor so local: http://localhost:{PORT}/{SECRET}/mcp", flush=True)
+        return
     from pyngrok import ngrok, conf
-    conf.get_default().auth_token = os.environ["NGROK_AUTHTOKEN"]
-    last_err = None
-    for opts in [{"url": "https://" + DOMAIN}, {"domain": DOMAIN}, {}]:
+    conf.get_default().auth_token = token
+    while True:
+        TUNNEL["tentativas"] += 1
+        TUNNEL["state"] = "conectando"
         try:
-            t = ngrok.connect(addr=PORT, proto="http", **opts)
-            return t.public_url.replace("http://", "https://")
-        except Exception as e:
-            last_err = e
-            print(f"[ngrok] tentativa {opts or 'sem dominio'} falhou: {str(e)[:200]}", flush=True)
-    raise RuntimeError(f"ngrok nao conectou: {last_err}")
+            ngrok.kill()
+        except Exception:
+            pass
+        t = None
+        err = None
+        for opts in ({"url": "https://" + DOMAIN}, {"domain": DOMAIN}):
+            try:
+                t = ngrok.connect(addr=PORT, proto="http", **opts)
+                break
+            except Exception as e:
+                err = _explica(str(e))
+                print(f"[ngrok] tentativa {TUNNEL['tentativas']} {list(opts)[0]} falhou: {err}",
+                      flush=True)
+        if t is None:
+            TUNNEL.update(state="erro", erro=err)
+            time.sleep(20)
+            continue
+        pub = t.public_url.replace("http://", "https://")
+        TUNNEL.update(state="no_ar", url=pub, erro=None)
+        print(f"\n=== COLE NO CLAUDE / JJserver APK ===\n{pub}/{SECRET}/mcp\n", flush=True)
+        if pub != "https://" + DOMAIN:
+            print(f"AVISO: ngrok abriu {pub} e nao o dominio fixo {DOMAIN}", flush=True)
+        while True:
+            time.sleep(30)
+            try:
+                if not ngrok.get_tunnels():
+                    raise RuntimeError("tunel caiu")
+            except Exception as e:
+                TUNNEL.update(state="reconectando", erro=str(e)[:200])
+                print(f"[ngrok] tunel perdido ({e}); reconectando...", flush=True)
+                break
 
 if __name__ == "__main__":
     threading.Thread(target=_heartbeat, daemon=True).start()
-    if os.environ.get("NGROK_AUTHTOKEN"):
-        pub = _open_tunnel()
-        if pub != "https://" + DOMAIN:
-            print(f"AVISO: o ngrok abriu {pub} em vez de https://{DOMAIN}", flush=True)
-        print(f"\n=== COLE NO CLAUDE / JJserver APK ===\n{pub}/{SECRET}/mcp\n", flush=True)
-    else:
-        print(f"Sem NGROK_AUTHTOKEN. Local: http://localhost:{PORT}/{SECRET}/mcp", flush=True)
+    threading.Thread(target=_tunnel_loop, daemon=True).start()
     mcp.run(transport="streamable-http")
