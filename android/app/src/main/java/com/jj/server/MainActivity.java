@@ -5,9 +5,10 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.net.Uri;
 import android.os.Bundle;
+import android.text.Editable;
 import android.text.InputType;
+import android.text.TextWatcher;
 import android.view.View;
 import android.widget.Button;
 import android.widget.EditText;
@@ -26,25 +27,45 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 public class MainActivity extends Activity {
+    static final String DEF_DOMAIN = "subpanel-unreached-skinning.ngrok-free.dev";
+    static final String DEF_SECRET = "JJsecreto2026xyz";
+    static final String DEF_REPO = "jcksdjhsmilton-sketch/JJserver";
+
     interface Job { void run() throws Exception; }
 
     SharedPreferences sp;
-    EditText token, repo, url;
-    TextView log;
+    EditText token, repo, domain, secret;
+    TextView urlView, log;
     ExecutorService ex = Executors.newSingleThreadExecutor();
 
     @Override
     protected void onCreate(Bundle b) {
         super.onCreate(b);
-        sp = getSharedPreferences("jj", MODE_PRIVATE);
+        sp = getSharedPreferences("jj2", MODE_PRIVATE);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(24, 48, 24, 24);
 
-        token = field("GitHub token (permissao Codespaces)", "token");
+        token = field("GitHub token (permissao codespace)", sp.getString("token", ""));
         token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-        repo = field("Repositorio (ex: usuario/JJserver) - opcional", "repo");
-        url = field("https://seu-dominio.ngrok-free.app/SEGREDO/mcp", "url");
+        repo = field("Repositorio (usuario/JJserver)", sp.getString("repo", DEF_REPO));
+        domain = field("Dominio ngrok", sp.getString("domain", DEF_DOMAIN));
+        secret = field("Segredo (JJ_SECRET)", sp.getString("secret", DEF_SECRET));
+
+        TextView label = new TextView(this);
+        label.setText("URL do MCP (cole no Claude):");
+        urlView = new TextView(this);
+        urlView.setTextIsSelectable(true);
+        urlView.setTextSize(15f);
+        urlView.setText(mcpUrl());
+
+        TextWatcher tw = new TextWatcher() {
+            public void beforeTextChanged(CharSequence s, int a, int c, int d) {}
+            public void onTextChanged(CharSequence s, int a, int c, int d) {}
+            public void afterTextChanged(Editable s) { urlView.setText(mcpUrl()); }
+        };
+        domain.addTextChangedListener(tw);
+        secret.addTextChangedListener(tw);
 
         LinearLayout r1 = row(), r2 = row();
         r1.addView(btn("Status", v -> bg(this::refresh)));
@@ -55,23 +76,27 @@ public class MainActivity extends Activity {
 
         log = new TextView(this);
         log.setTextIsSelectable(true);
-        ScrollView sv = new ScrollView(this);
-        sv.addView(log);
+        log.setPadding(0, 24, 0, 0);
 
         root.addView(token);
         root.addView(repo);
-        root.addView(url);
+        root.addView(domain);
+        root.addView(secret);
+        root.addView(label);
+        root.addView(urlView);
         root.addView(r1);
         root.addView(r2);
-        root.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
-        setContentView(root);
+        root.addView(log);
+        ScrollView sv = new ScrollView(this);
+        sv.addView(root);
+        setContentView(sv);
     }
 
-    EditText field(String hint, String key) {
+    EditText field(String hint, String value) {
         EditText e = new EditText(this);
         e.setHint(hint);
         e.setSingleLine(true);
-        e.setText(sp.getString(key, ""));
+        e.setText(value);
         return e;
     }
 
@@ -89,12 +114,23 @@ public class MainActivity extends Activity {
         return x;
     }
 
+    String host() {
+        String d = domain.getText().toString().trim().replace("https://", "").replace("http://", "");
+        while (d.endsWith("/")) d = d.substring(0, d.length() - 1);
+        return d;
+    }
+
+    String baseUrl() { return "https://" + host(); }
+
+    String mcpUrl() { return baseUrl() + "/" + secret.getText().toString().trim() + "/mcp"; }
+
     void say(String s) { runOnUiThread(() -> log.setText(s)); }
 
     void bg(Job j) {
         sp.edit().putString("token", token.getText().toString().trim())
                 .putString("repo", repo.getText().toString().trim())
-                .putString("url", url.getText().toString().trim()).apply();
+                .putString("domain", domain.getText().toString().trim())
+                .putString("secret", secret.getText().toString().trim()).apply();
         say("...");
         ex.execute(() -> {
             try { j.run(); } catch (Exception e) { say("Erro: " + e.getMessage()); }
@@ -148,26 +184,50 @@ public class MainActivity extends Activity {
 
     void refresh() throws Exception {
         JSONObject o = findCs();
-        say(o.getString("display_name") + "\nrepo: " + o.getJSONObject("repository").getString("full_name")
-                + "\nestado: " + o.getString("state"));
+        say(o.getString("display_name") + "\nestado: " + o.getString("state")
+                + "\n\nURL MCP:\n" + mcpUrl());
     }
 
     void action(String a) throws Exception {
         JSONObject o = findCs();
         gh("POST", "/user/codespaces/" + o.getString("name") + "/" + a);
-        say("Comando '" + a + "' enviado. Aguardando...");
-        Thread.sleep(5000);
-        refresh();
+        if (a.equals("start")) {
+            say("Ligando...");
+            waitUp();
+        } else {
+            say("Desligando...");
+            Thread.sleep(5000);
+            refresh();
+        }
+    }
+
+    void waitUp() throws Exception {
+        for (int i = 0; i < 30; i++) {
+            Thread.sleep(5000);
+            String st = findCs().getString("state");
+            if (st.equals("Available")) {
+                try {
+                    String r = http("GET", baseUrl() + "/status", null);
+                    if (r.contains("\"ok\"")) {
+                        say("Servidor no ar!\n\nURL MCP:\n" + mcpUrl());
+                        return;
+                    }
+                } catch (Exception ignore) { }
+                say("Codespace ligado, esperando o servidor subir... (" + (i * 5) + "s)");
+            } else {
+                say("Estado: " + st + " (" + (i * 5) + "s)");
+            }
+        }
+        say("Demorou. Toque em Testar MCP. Se nao subir, rode no terminal: python server/server.py");
     }
 
     void testMcp() throws Exception {
-        Uri p = Uri.parse(url.getText().toString().trim());
-        say(http("GET", p.getScheme() + "://" + p.getAuthority() + "/status", null));
+        say(http("GET", baseUrl() + "/status", null) + "\n\nURL MCP:\n" + mcpUrl());
     }
 
     void copy() {
         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-        cm.setPrimaryClip(ClipData.newPlainText("mcp", url.getText().toString().trim()));
-        Toast.makeText(this, "Copiado!", Toast.LENGTH_SHORT).show();
+        cm.setPrimaryClip(ClipData.newPlainText("mcp", mcpUrl()));
+        Toast.makeText(this, "URL copiada!", Toast.LENGTH_SHORT).show();
     }
 }
